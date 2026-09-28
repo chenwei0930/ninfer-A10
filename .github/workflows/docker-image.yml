@@ -12,7 +12,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/ninfer-A10
+  IMAGE_NAME: ghcr.io/ninfer-a10
 
 jobs:
   build:

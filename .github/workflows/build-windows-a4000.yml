@@ -1,0 +1,171 @@
+name: Build Windows 86 13.1 package
+
+on:
+  workflow_dispatch:
+    inputs:
+      ninfer_tag:
+        description: "要编译的 ninfer-all tag，例如 v0.10.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    env:
+      CUDA_VERSION: "13.1.0"
+      CUDA_ARCH: "86"
+      BUILD_TYPE: "Release"
+      SOURCE_TAG: ${{ inputs.ninfer_tag }}
+
+    steps:
+      # 从你的 fork 检出选定 tag。tag 必须存在于 fork 中。
+      - name: Checkout ninfer-all tag
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.ninfer_tag }}
+          path: source
+          persist-credentials: false
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.1.0"
+
+      - name: Show toolchain versions
+        shell: pwsh
+        run: |
+          cmake --version
+          ninja --version
+          nvcc --version
+          git -C source rev-parse HEAD
+
+      - name: Install vcpkg
+        shell: pwsh
+        run: |
+          $vcpkg = Join-Path $env:RUNNER_TEMP "vcpkg"
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkg
+          & "$vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          "VCPKG_ROOT=$vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S source -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES=86 `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --target ninfer-serve ninfer-calibrate --parallel
+
+      - name: Package ZIP
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tag = $env:SOURCE_TAG
+          $commit = (git -C source rev-parse HEAD).Trim()
+          $safeTag = $tag -replace '[^A-Za-z0-9._-]', '_'
+
+          $packageName = "ninfer-all-win-cuda$env:CUDA_VERSION-sm$env:CUDA_ARCH-$safeTag"
+          $bundle = Join-Path $PWD "dist\$packageName"
+          $zip = Join-Path $PWD "dist\$packageName.zip"
+
+          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+
+          # 主服务程序
+          $serve = "build\apps\ninfer-serve.exe"
+          if (-not (Test-Path $serve)) {
+            throw "找不到构建产物：$serve"
+          }
+          Copy-Item $serve $bundle
+
+          # 校准工具。如果所选 tag 没有这个目标或文件，可删除这段检查和复制。
+          $calibrate = "build\apps\ninfer-calibrate.exe"
+          if (Test-Path $calibrate) {
+            Copy-Item $calibrate $bundle
+          }
+
+          # 构建系统放在 apps 目录中的运行时 DLL
+          Get-ChildItem "build\apps" -Filter "*.dll" -File |
+            Copy-Item -Destination $bundle
+
+          # CUDA 13 的 cuBLAS DLL；打包脚本需随 CUDA 主版本使用对应 DLL 名称。
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          foreach ($dll in @("cublas64_13.dll", "cublasLt64_13.dll")) {
+            $path = Join-Path $cudaBin $dll
+            if (-not (Test-Path $path)) {
+              throw "CUDA 运行库未找到：$path"
+            }
+            Copy-Item $path $bundle
+          }
+
+          $eula = Join-Path $env:CUDA_PATH "EULA.txt"
+          if (Test-Path $eula) {
+            Copy-Item $eula (Join-Path $bundle "NVIDIA-CUDA-EULA.txt")
+          }
+
+          if (Test-Path "source\LICENSE") {
+            Copy-Item "source\LICENSE" $bundle
+          }
+
+          @"
+          NInfer-all Windows x64 package
+          Source tag: $tag
+          Source commit: $commit
+          CUDA Toolkit: $env:CUDA_VERSION
+          CUDA architecture: sm_$env:CUDA_ARCH
+          Target GPU: NVIDIA RTX A4000/A10/3090
+          Build configuration: $env:BUILD_TYPE
+          "@ | Set-Content -Path (Join-Path $bundle "BUILD-INFO.txt") -Encoding utf8
+
+          # 在仅有 Windows 系统 PATH 的情况下启动 --help，检查基本 DLL 是否齐全。
+          $oldPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            & (Join-Path $bundle "ninfer-serve.exe") --help *> $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "ninfer-serve.exe --help 失败，退出码：$LASTEXITCODE"
+            }
+          }
+          finally {
+            $env:PATH = $oldPath
+          }
+
+          # 包内文件校验和
+          $hashLines = Get-ChildItem $bundle -File |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            }
+          $hashLines | Set-Content (Join-Path $bundle "SHA256SUMS.txt") -Encoding ascii
+
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          Compress-Archive -Path "$bundle\*" -DestinationPath $zip -CompressionLevel Optimal
+
+          $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  $packageName.zip" |
+            Set-Content "dist\$packageName.zip.sha256" -Encoding ascii
+
+          "artifact_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Get-ChildItem "dist\$packageName*"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            dist/${{ steps.package.outputs.artifact_name }}.zip
+            dist/${{ steps.package.outputs.artifact_name }}.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
